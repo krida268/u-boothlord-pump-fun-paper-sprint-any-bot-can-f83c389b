@@ -40,11 +40,22 @@ const CURVE_FEE = 0.0125; // protocol 95 bps + creator 30 bps, on each side
 const MIN_CAP_SOL = 0.02; // buy when the 1% cap first reaches this many SOL
 const STAKE_SOL = 0.05; // SOL per coin, capped by the cap itself
 const MAX_ENTRY_MULT = 1.2; // never buy past this multiple of creation price
-const TAKE_PROFIT = 1.2; // sell when mark value reaches this multiple of cost
+// Revision 1 (24 Nov, after the first grade-local): TAKE_PROFIT 1.20 -> 1.35.
+// The dev window says the median peak after entry is 2.20x, so clipping every
+// winner at 1.20x leaves most of the move on the table while the bot still pays
+// full fees (~2.5% curve + tx) on every round trip. Letting winners run to
+// 1.35x before the take-profit fires should raise the average win size; the
+// trailing stop (armed at 1.50x) still protects any coin that runs further.
+const TAKE_PROFIT = 1.35; // sell when mark value reaches this multiple of cost
 const STOP_LOSS = 0.97; // sell when mark value falls to this multiple of cost
 const TRAIL_ARM = 1.5; // arm the trailing stop at this multiple of cost
 const TRAIL = 0.7; // once armed, sell below this share of the peak value
-const MAX_HOLD_SLOTS = 200; // sell a flat position after this many slots held
+// Revision 2 (24 Nov, after the second grade-local): MAX_HOLD_SLOTS 200 -> 120.
+// The dev window says the median coin peaks 7 slots after creation, so a coin
+// still flat after 120 slots has almost certainly missed its run — but it keeps
+// occupying a position slot while fresh coins wait. Cutting the flat-hold limit
+// frees slots ~40% sooner for new entries, which is where breadth comes from.
+const MAX_HOLD_SLOTS = 120; // sell a flat position after this many slots held
 const HOLD_IF_UP = 1.1; // at the time limit, keep holding above this multiple
 const SLIP_BPS = 10_000; // wide open: latency must never refuse a fill
 
