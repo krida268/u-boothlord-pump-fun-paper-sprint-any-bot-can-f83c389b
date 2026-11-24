@@ -55,6 +55,14 @@ const TRAIL = 0.7; // once armed, sell below this share of the peak value
 // still flat after 120 slots has almost certainly missed its run — but it keeps
 // occupying a position slot while fresh coins wait. Cutting the flat-hold limit
 // frees slots ~40% sooner for new entries, which is where breadth comes from.
+// Revision 3 (24 Nov, after the round-1 run_completes timeout): speed, not
+// strategy. The dev grade replays ~400k batches and the old code rescanned
+// every held coin — rebuilding the whole pending list per coin — on EVERY
+// batch, plus rebuilt the pending-buy set and the committed-position set per
+// batch. Bookkeeping now updates incrementally from fills instead: positions
+// only change on a batch carrying their fill, so the held-prune runs only
+// then, and pending buys are tracked in a set added on send and cleared on
+// fill. Same orders, same fills, far less work per batch.
 const MAX_HOLD_SLOTS = 120; // sell a flat position after this many slots held
 const HOLD_IF_UP = 1.1; // at the time limit, keep holding above this multiple
 const SLIP_BPS = 10_000; // wide open: latency must never refuse a fill
@@ -63,6 +71,11 @@ const SLIP_BPS = 10_000; // wide open: latency must never refuse a fill
 const decided = new Set<string>(); // coins already bought once (never re-entered)
 const held = new Map<string, { opened: number; peakValue: number; cost: number }>();
 const pendingSell = new Set<string>(); // mints with a sell already in flight
+// Mints with a buy in flight. Kept incrementally: added when the buy is sent
+// (section 3), cleared when its fill arrives (section 1). It mirrors exactly
+// what the old per-batch rebuild of state.pending's buys produced, without
+// rebuilding a set and two arrays on every one of the ~400k batches.
+const pendingBuys = new Set<string>();
 const createPrice = new Map<string, number>(); // mint -> vq/vt at its CreateEvent
 
 // Mark-to-market value of a position in SOL, curve + tx fees deducted.
@@ -85,22 +98,48 @@ await runBot({
     const tx = Number(state.txFeeLamports()) / LAMPORTS;
 
     // 1) Refresh bookkeeping from this batch's fills.
+    // Positions only ever change on a batch that carries their fill, so the
+    // prune below runs only on fill batches. The old code rescanned every held
+    // coin — and rebuilt the whole pending list per coin — on all ~400k
+    // batches; that per-batch allocation churn is what made the run slow. A
+    // stale `held` entry is inert (exits iterate positions, entries are gated
+    // by `decided`), so deferring the prune to fill batches cannot change
+    // any order.
     for (const f of batch.fills) {
       if (f.client_id.startsWith('_')) continue; // harness closes, not ours
-      if (f.side === 'buy' && f.status === 'filled') {
-        const h = held.get(f.mint);
-        if (h !== undefined) h.cost = Number(f.quote_lamports) / LAMPORTS + tx;
+      if (f.side === 'buy') {
+        pendingBuys.delete(f.mint);
+        if (f.status === 'filled') {
+          const h = held.get(f.mint);
+          if (h !== undefined) h.cost = Number(f.quote_lamports) / LAMPORTS + tx;
+        } else {
+          held.delete(f.mint); // rejected/failed buy: never becomes a position
+        }
       }
       if (f.side === 'sell') pendingSell.delete(f.mint);
     }
-    // Positions the harness closed (complete / flatten) drop out of state.
-    for (const mint of [...held.keys()]) {
-      if (
-        !state.positions.has(mint) &&
-        ![...state.pending.values()].some((po) => po.order.mint === mint)
-      ) {
-        held.delete(mint);
-        pendingSell.delete(mint);
+    // Positions the harness closed (complete / flatten / write-off) drop out of
+    // state on the batch their close fill arrives in. Only the mints named by
+    // this batch's fills can have changed, so only those are checked — never
+    // the whole held map, and the pending scan runs once per fill mint, not
+    // once per held coin per batch.
+    if (batch.fills.length > 0) {
+      const seen = new Set<string>();
+      for (const f of batch.fills) {
+        if (seen.has(f.mint)) continue;
+        seen.add(f.mint);
+        if (!held.has(f.mint) || state.positions.has(f.mint)) continue;
+        let stillPending = false;
+        for (const po of state.pending.values()) {
+          if (po.order.mint === f.mint) {
+            stillPending = true;
+            break;
+          }
+        }
+        if (!stillPending) {
+          held.delete(f.mint);
+          pendingSell.delete(f.mint);
+        }
       }
     }
 
@@ -126,10 +165,14 @@ await runBot({
 
     // 3) Entries: the first batch a coin's cap allows a meaningful buy.
     let free = Number(state.freeCashLamports()) / LAMPORTS;
-    let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
-    const pendingBuys = new Set(
-      [...state.pending.values()].filter((po) => po.order.side === 'buy').map((po) => po.order.mint),
-    );
+    // Slots taken = positions held + buys in flight. `pendingBuys` is kept
+    // incrementally (section 1) instead of rebuilt from state.pending on
+    // every batch, and the committed count no longer builds a set per batch:
+    // a mint never holds a position and a buy in flight at once, so the count
+    // is positions plus pending buys (minus any overlap, checked cheaply —
+    // pending buys are at most a couple of batches' worth).
+    let slotsLeft = state.hello.caps.max_open_positions - state.positions.size;
+    for (const mint of pendingBuys) if (!state.positions.has(mint)) slotsLeft -= 1;
     for (const e of batch.events) {
       if (orders.length >= cap || slotsLeft <= 0) break;
       if (e.event === 'CreateEvent') {
